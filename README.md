@@ -4,6 +4,8 @@ An [Omarchy](https://omarchy.org/) shell plugin for the CPU and case fans:
 a bar widget with a real-time CPU temperature graph, a fan speed gauge, and
 slider-driven fan curves for every pwm-capable fan the system exposes.
 
+![Cooler Control panel, showing the CPU temperature graph, fan gauge, and custom fan curve sliders](screenshot.png)
+
 ## Why
 
 Linux exposes fan control through raw sysfs files under
