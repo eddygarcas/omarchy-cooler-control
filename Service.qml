@@ -6,12 +6,19 @@ import "Model.js" as Model
 // Polls CPU temperature and every pwm-capable fan the system exposes over
 // sysfs (/sys/class/hwmon), and — for zones the user switches to "custom" —
 // writes a software fan curve back to the hardware. Reads never need
-// privilege; writes to pwm*/pwm*_enable do, so they go through pkexec. To
-// keep the unattended curve loop from turning into a password prompt every
-// couple of seconds, its writes only fire when the target duty actually
-// drifts (see applyCurveTick) and are throttled to one attempt per zone per
-// applyMinIntervalMs; a direct user action (mode toggle, slider release)
-// always applies immediately instead.
+// privilege; writes to pwm*/pwm*_enable are attempted unprivileged first and
+// only escalate to pkexec on failure (see _writeCommandFor) — a system with
+// a udev rule granting group write on those files (see the plugin's setup
+// notes) never needs pkexec at all, which matters because
+// org.freedesktop.policykit.exec caches no authentication, so every
+// escalated write used to mean a fresh password/FIDO2 prompt. To keep the
+// unattended curve loop from prompting every couple of seconds on a system
+// without that udev rule, its writes only fire when the target duty
+// actually drifts (see applyCurveTick) and are throttled to one attempt per
+// zone per applyMinIntervalMs; a direct user action (mode toggle) applies
+// immediately instead, while threshold slider releases are debounced (see
+// setThresholds) so editing quiet/ramp/full in one sitting triggers at most
+// one write rather than one per slider.
 QtObject {
   id: root
 
@@ -158,7 +165,27 @@ QtObject {
     var next = mutator({ quietC: zone.quietC, rampC: zone.rampC, fullC: zone.fullC }, value)
     replaceZone(key, next)
     saveState()
-    if (zone.mode === "custom") applyDutyFor(zoneByKey(key))
+    // Quiet/ramp/full are committed as three separate slider releases, and
+    // org.freedesktop.policykit.exec (the generic action pkexec uses here)
+    // grants auth_admin with no keep-caching — so each immediate apply would
+    // reprompt for a password. Debounce so a same-sitting edit of all three
+    // thresholds collapses into a single privileged write.
+    if (zone.mode === "custom") {
+      thresholdApplyTimer.zoneKey = key
+      thresholdApplyTimer.restart()
+    }
+  }
+
+  readonly property int thresholdApplyDebounceMs: 600
+  property Timer thresholdApplyTimer: Timer {
+    id: thresholdApplyTimer
+    property string zoneKey: ""
+    interval: root.thresholdApplyDebounceMs
+    repeat: false
+    onTriggered: {
+      var zone = root.zoneByKey(zoneKey)
+      if (zone) root.applyDutyFor(zone)
+    }
   }
 
   function refresh() {
@@ -304,10 +331,22 @@ QtObject {
     _writeBusy = true
     var item = _writeQueue.shift()
     writeProcess.currentItem = item
-    writeProcess.command = (item.kind === "duty" || item.kind === "identify")
-      ? [root._pkexecBin, root._bashBin, "-c", root._writeDutyScript, "bash", item.pwmPath, item.enablePath, String(item.raw)]
-      : [root._pkexecBin, root._bashBin, "-c", root._writeValueScript, "bash", item.enablePath, item.value]
+    writeProcess.command = _writeCommandFor(item, false)
     writeProcess.running = true
+  }
+
+  // A udev rule can grant a group (see the eduard.cooler-control setup docs)
+  // write access to pwm*/pwm*_enable directly, so try the plain write first
+  // and only pay for pkexec — and its authentication prompt — when that
+  // fails. Once the udev rule + group membership are in place this never
+  // escalates, which is what actually stops the repeated auth prompts:
+  // org.freedesktop.policykit.exec has no auth caching, so every escalated
+  // write used to mean a fresh prompt.
+  function _writeCommandFor(item, escalate) {
+    var bin = escalate ? [root._pkexecBin, root._bashBin] : [root._bashBin]
+    return (item.kind === "duty" || item.kind === "identify")
+      ? bin.concat(["-c", root._writeDutyScript, "bash", item.pwmPath, item.enablePath, String(item.raw)])
+      : bin.concat(["-c", root._writeValueScript, "bash", item.enablePath, item.value])
   }
 
   function detectFanController() {
@@ -452,9 +491,10 @@ QtObject {
     "done"
   ].join("\n")
 
-  // Defense in depth for both scripts below, which run as root via pkexec:
-  // neither trusts a path argument just because the caller is this
-  // plugin's own JS. Even though sysfs paths here always come from our own
+  // Defense in depth for both scripts below, which may run as root via
+  // pkexec (see _writeCommandFor): neither trusts a path argument just
+  // because the caller is this plugin's own JS. Even though sysfs paths
+  // here always come from our own
   // enumeration (unprivileged users can't plant nodes under
   // /sys/class/hwmon — it's kernel-managed, not attacker-writable today),
   // a *privileged* script should independently re-verify it's staying
@@ -523,6 +563,12 @@ QtObject {
     command: []
     onExited: function(exitCode) {
       var item = writeProcess.currentItem
+      if (item && exitCode !== 0 && !item._escalated) {
+        item._escalated = true
+        writeProcess.command = root._writeCommandFor(item, true)
+        writeProcess.running = true
+        return
+      }
       writeProcess.currentItem = null
       root._writeBusy = false
       if (item) {
