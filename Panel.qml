@@ -30,13 +30,20 @@ Panel {
   // One rule for "is there a fan talking back on this header?", shared by
   // the compact selector's dimming, the name caption, the hero hint, and
   // the expanded cards: RPM reported at some point in the sparkline window.
-  function isReporting(zone) {
-    if (!zone || zone.unplugged) return false
-    var h = zone.rpmHistory || []
-    for (var i = 0; i < h.length; i++) if (h[i] > 0) return true
-    return zone.rpm > 0
+  function isReporting(zone) { return Model.isReporting(zone) }
+  readonly property var reportingZones: root.zones.filter(Model.isReporting)
+
+  // Caption for a header, by why it is (or isn't) reporting -- see
+  // Model.silenceState. "Silent while driven" and "silent at idle" are
+  // different facts and must not share the word "unplugged".
+  function silenceCaption(zone) {
+    switch (Model.silenceState(zone)) {
+      case "reporting": return "reporting RPM"
+      case "no-tach": return "no tachometer input"
+      case "silent-driven": return "no fan reporting — driven with no RPM (unplugged, or no tachometer wire)"
+      default: return "stopped at " + Model.formatDuty(zone ? zone.duty : -1) + " duty — no RPM to judge by; use Identify to check"
+    }
   }
-  readonly property var reportingZones: root.zones.filter(root.isReporting)
   readonly property bool available: svc ? svc.available : false
   readonly property bool detecting: svc ? svc.detecting : false
   readonly property string detectError: svc ? svc.detectError : ""
@@ -392,9 +399,10 @@ Panel {
                 + "Most desktop boards expose one once lm_sensors probes and loads "
                 + "the right Super I/O driver (nct6775, it87, ...)."
               : "Found " + root.zones.length + " fan header" + (root.zones.length === 1 ? "" : "s")
-                + ", but none has reported an RPM signal yet. That usually means "
-                + "nothing is plugged in — or the fan has no tachometer wire. Every "
-                + "header stays listed below either way; use Identify to check by ear."
+                + ", but none has reported an RPM signal yet. A header driven hard "
+                + "and still silent has nothing with a tachometer on it; one idling at "
+                + "a low duty simply hasn't been asked to spin. Every header stays "
+                + "listed below either way; use Identify to check by ear."
             color: Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -442,9 +450,7 @@ Panel {
               required property var modelData
               text: modelData.label
               opacity: root.isReporting(modelData) ? 1 : 0.5
-              tooltipText: root.isReporting(modelData)
-                ? ""
-                : "No RPM reading — nothing plugged in, or a fan without a tachometer wire"
+              tooltipText: root.isReporting(modelData) ? "" : root.silenceCaption(modelData)
               selected: modelData.key === root.selectedZoneKey
               fontSize: Style.font.bodySmall
               foreground: root.bar.foreground
@@ -519,11 +525,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             width: parent.width
-            text: root.selectedZone
-              ? root.selectedZone.key + (root.selectedZone.fanPath === "" ? " · no tachometer input"
-                : root.isReporting(root.selectedZone) ? " · reporting RPM"
-                : " · no RPM reading (unplugged, or no tachometer wire)")
-              : ""
+            text: root.selectedZone ? root.selectedZone.key + " · " + root.silenceCaption(root.selectedZone) : ""
             color: Qt.darker(root.bar.foreground, 1.6)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption

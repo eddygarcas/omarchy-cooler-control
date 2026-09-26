@@ -57,9 +57,13 @@ same.
   it is Identify, which used to make exactly such a fan vanish from the
   list mid-click. A dimmed zone stays selectable so it can still be
   identified, renamed, or driven; the caption under the name field says
-  why it's dimmed. This is the same rule the expanded view uses to decide
-  which fans get a card, so the two views always agree on which headers
-  have a fan talking back.
+  why it's dimmed — and *why* matters: a header that has been driven at a
+  real duty (40% or more) and stayed silent has nothing with a tachometer
+  on it, while one idling at 0% or a few percent simply hasn't been asked
+  to spin (boards park semi-passive fans exactly like that), so it is
+  captioned as stopped, not unplugged. This is the same rule the expanded
+  view uses to decide which fans get a card, so the two views always agree
+  on which headers have a fan talking back.
 - **Fan name + Identify** — sysfs has no concept of "front fan" or "CPU fan"
   beyond whatever label the board's own driver happens to report (many
   report none at all), so each zone starts out guessed: the first

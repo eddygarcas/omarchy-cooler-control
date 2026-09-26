@@ -215,6 +215,34 @@ function autoEnableValue(zone, zones) {
   return best || "2"
 }
 
+// Has this header had a fan talking back inside the sparkline window?
+function isReporting(zone) {
+  if (!zone || zone.unplugged) return false
+  var h = zone.rpmHistory || []
+  for (var i = 0; i < h.length; i++) if (h[i] > 0) return true
+  return zone.rpm > 0
+}
+
+// Why a header is silent matters as much as that it is. Driven at a real
+// duty and still silent means nothing with a tachometer is on it. Silent at
+// idle -- 0% or a few percent, which is how boards park semi-passive fans --
+// says nothing either way, so that state must not be described as
+// "unplugged". Returns one of:
+//   "reporting"     RPM seen in the window
+//   "no-tach"       the header has no fanN_input at all
+//   "silent-driven" no RPM although driven at >= UNPLUGGED_MIN_DUTY (now or
+//                   earlier in the window), or the chip's fault flag is set
+//   "silent-idle"   no RPM, but never driven hard enough to expect any
+function silenceState(zone) {
+  if (!zone) return "silent-idle"
+  if (zone.fanPath === "") return "no-tach"
+  if (isReporting(zone)) return "reporting"
+  var maxDuty = Math.max(0, Number(zone.duty) || 0)
+  var h = zone.dutyHistory || []
+  for (var i = 0; i < h.length; i++) if (h[i] > maxDuty) maxDuty = h[i]
+  return (zone.unplugged || maxDuty >= UNPLUGGED_MIN_DUTY) ? "silent-driven" : "silent-idle"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     MIN_DUTY: MIN_DUTY,
@@ -243,6 +271,8 @@ if (typeof module !== "undefined") {
     UNPLUGGED_STREAK_THRESHOLD: UNPLUGGED_STREAK_THRESHOLD,
     UNPLUGGED_MIN_DUTY: UNPLUGGED_MIN_DUTY,
     nextUnpluggedState: nextUnpluggedState,
+    isReporting: isReporting,
+    silenceState: silenceState,
     isManualEnable: isManualEnable,
     boardNotInControl: boardNotInControl,
     autoEnableValue: autoEnableValue
