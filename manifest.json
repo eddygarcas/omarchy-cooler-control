@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "eduard.cooler-control",
   "name": "Cooler Control",
-  "version": "1.1.0",
-  "author": "Eduard G. Castell\u00f3",
+  "version": "1.2.0",
+  "author": "Eduard G. Castelló",
   "license": "MIT",
   "homepage": "https://github.com/eddygarcas/omarchy-cooler-control",
-  "description": "Real-time CPU temperature graph and fan speed gauge, with slider-driven fan curves for every pwm-capable CPU/case fan the system exposes.",
+  "description": "Real-time CPU temperature graph and fan speed gauge, with slider-driven fan curves for every pwm-capable CPU/case fan the system exposes. Expand for one card per fan: live duty/RPM, speed graph, and the curve with its thresholds.",
   "kinds": [
     "service",
     "bar-widget"
@@ -17,7 +17,7 @@
   },
   "barWidget": {
     "displayName": "Cooler Control",
-    "description": "Temperature graph, fan speed gauge, and fan curve control",
+    "description": "Temperature graph, fan speed gauge, fan curve control, and an expanded per-fan card view",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

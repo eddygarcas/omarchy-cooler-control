@@ -90,6 +90,20 @@ function setFull(thresholds, value) {
   return normalizeThresholds(next)
 }
 
+// Fan names come from two places this plugin does not control: the user's
+// own state.json (rewritable by any same-user process) and the board
+// driver's fanN_label. Both are rendered into shell-owned controls, so cap
+// and clean them at ingestion: trim, drop control characters, and bound
+// the length -- a name is a short tag, not a paragraph.
+var LABEL_MAX_LENGTH = 48
+
+function cleanLabel(value) {
+  var text = typeof value === "string" ? value : ""
+  text = text.replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, "").trim()
+  if (text.length > LABEL_MAX_LENGTH) text = text.slice(0, LABEL_MAX_LENGTH).trim()
+  return text
+}
+
 function pushHistory(history, sample) {
   var next = history ? history.slice() : []
   next.push(sample)
@@ -133,6 +147,34 @@ function nextUnpluggedState(state, sample) {
   return { unplugged: !!(state && state.unplugged), streak: streak }
 }
 
+// The curve as a polyline over the whole temperature axis, for drawing:
+// flat at MIN_DUTY up to quiet, up to RAMP_DUTY at ramp, up to FULL_DUTY at
+// full, flat from there. Same shape dutyForTemperature() evaluates.
+function curvePoints(thresholds) {
+  var t = normalizeThresholds(thresholds)
+  return [
+    { temp: TEMP_MIN, duty: MIN_DUTY },
+    { temp: t.quietC, duty: MIN_DUTY },
+    { temp: t.rampC, duty: RAMP_DUTY },
+    { temp: t.fullC, duty: FULL_DUTY },
+    { temp: TEMP_MAX, duty: FULL_DUTY }
+  ]
+}
+
+// Y-axis ceiling for a history sparkline: the series maximum plus headroom,
+// rounded up to a clean step, and never under `floor` so an idle fan's flat
+// 0 RPM line doesn't get stretched into a full-height plateau.
+function historyCeiling(history, floor) {
+  var max = 0
+  for (var i = 0; history && i < history.length; i++) {
+    var v = Number(history[i])
+    if (isFinite(v) && v > max) max = v
+  }
+  var withHeadroom = max * 1.15
+  var step = withHeadroom > 2000 ? 500 : withHeadroom > 500 ? 250 : withHeadroom > 100 ? 100 : 10
+  return Math.max(Number(floor) || 0, Math.ceil(withHeadroom / step) * step)
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     MIN_DUTY: MIN_DUTY,
@@ -151,7 +193,11 @@ if (typeof module !== "undefined") {
     setQuiet: setQuiet,
     setRamp: setRamp,
     setFull: setFull,
+    LABEL_MAX_LENGTH: LABEL_MAX_LENGTH,
+    cleanLabel: cleanLabel,
     pushHistory: pushHistory,
+    curvePoints: curvePoints,
+    historyCeiling: historyCeiling,
     dutyToRaw: dutyToRaw,
     rawToDuty: rawToDuty,
     UNPLUGGED_STREAK_THRESHOLD: UNPLUGGED_STREAK_THRESHOLD,

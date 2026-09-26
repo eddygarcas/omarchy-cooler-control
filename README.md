@@ -49,15 +49,17 @@ same.
   speed-test dials) showing the selected fan's current duty cycle and RPM.
 - **Zone selector** — one pill button per pwm-capable header the board
   exposes (CPU fan, case fans, pump, ...), if there's more than one. A pwm
-  header still shows up in sysfs with nothing connected to it, so this
-  plugin watches each one for an RPM response (or the chip's own fault flag,
-  when it reports one): a header that has been driven hard and still reads
-  0 RPM is **dimmed**, not removed — "no RPM" also describes a real fan with
-  no tachometer wire (a 2- or 3-pin fan on a 4-pin header), and the one
-  action that drives a fan hard enough to judge it is Identify, which used
-  to make exactly such a fan vanish from the list mid-click. A dimmed zone
-  stays selectable so it can still be identified, renamed, or driven; the
-  caption under the name field says why it's dimmed.
+  header still shows up in sysfs with nothing connected to it, so a header
+  that has not reported any RPM in the last ~3 minutes (or that the chip's
+  own fault flag marks) is **dimmed**, not removed — "no RPM" also
+  describes a real fan with no tachometer wire (a 2- or 3-pin fan on a
+  4-pin header), and the one action that drives a fan hard enough to judge
+  it is Identify, which used to make exactly such a fan vanish from the
+  list mid-click. A dimmed zone stays selectable so it can still be
+  identified, renamed, or driven; the caption under the name field says
+  why it's dimmed. This is the same rule the expanded view uses to decide
+  which fans get a card, so the two views always agree on which headers
+  have a fan talking back.
 - **Fan name + Identify** — sysfs has no concept of "front fan" or "CPU fan"
   beyond whatever label the board's own driver happens to report (many
   report none at all), so each zone starts out guessed: the first
@@ -67,7 +69,10 @@ same.
   few seconds so you can tell which physical fan it is by ear or by eye,
   and the name field next to it lets you rename it to whatever you actually
   see — "Front Intake", "Rear Exhaust", whatever fits your case. Renames
-  persist across restarts; clearing the field goes back to the guess.
+  persist across restarts; clearing the field goes back to the guess. Names
+  are trimmed, stripped of control characters, and capped at 48 characters
+  when read back (from the state file or the board's own label), since
+  they're rendered into shell-owned controls.
 - **Custom fan curve** — a switch per fan. Off, the board's own fan curve (or
   BIOS/EC logic) stays in charge and this plugin only reads. On, three
   sliders drive the duty cycle from CPU temperature:
@@ -81,6 +86,48 @@ same.
     Timings plugin's screensaver/lock/suspend sliders: dragging one past a
     neighbor pushes that neighbor forward instead of landing on an invalid
     order.
+  - The same curve is drawn above the sliders, and its three breakpoints
+    can be dragged along the temperature axis as an alternative to the
+    sliders (see "Expanded view" below for details).
+- **Expanded view** — the **Expand** button in the panel header swaps the
+  single-fan layout for one rounded card per fan that is actually reporting
+  RPM, up to three across (the popup is capped to the screen and the cards
+  share whatever width is left; extra rows scroll). A header that has sent
+  no RPM in the last ~3 minutes — nothing plugged in, a fan without a
+  tachometer wire, or one the board has stopped at idle — has nothing to
+  chart, so it gets no card until it spins; it stays in the compact view's
+  selector (dimmed) where it can still be identified or renamed. Each card
+  has:
+  - the fan's name (editable in place, same rules as the name field above)
+    and its own custom-curve switch;
+  - the live duty cycle and RPM, plus a one-line status (auto / custom
+    curve with the duty the curve implies at the current CPU temperature /
+    identifying / no RPM reading);
+  - a speed graph of the last ~3 minutes — RPM when the header has a
+    tachometer input, duty cycle otherwise — auto-scaled with the ceiling
+    shown in its corner;
+  - on a custom curve: the curve itself (duty against CPU temperature) with
+    the three breakpoints marked and a dashed marker where the CPU currently
+    sits on it, and the three thresholds as **−/+** steppers (click for
+    1 °C, right-click for 5 °C) instead of sliders — the same quiet < ramp
+    < full ordering rule applies;
+  - the breakpoints on that chart are handles: **drag one left or right**
+    to move that threshold (the chart previews live and commits when you
+    let go). Only the temperature moves — a breakpoint's duty is fixed by
+    the curve shape (25% / 60% / 100%). Dragging past a neighbour pushes it
+    along, exactly like the sliders and steppers do;
+  - an **Identify** button and the zone's hwmon key.
+
+  Both views edit the same per-fan state, so a switch flipped, a threshold
+  moved, or a name typed on a card is exactly what the compact view shows
+  for that fan — and touching a card (any control on it, or its empty
+  space) makes that fan the selected one, highlighted with a stronger
+  fill, so **Collapse** lands on the fan just changed. The "Fan Speed" bar
+  readout follows the same selection.
+
+  The CPU temperature graph stays at the top, full width. **Collapse**
+  brings back the compact view; the choice is remembered across restarts
+  alongside the bar icon setting.
 - **Detect Fan Controller** — shown when no pwm-capable hwmon device is
   found. Runs `sensors-detect --auto` via `pkexec` (the standard lm_sensors
   probe-and-load tool) and rescans afterward.
@@ -150,7 +197,9 @@ that by hand if you want thresholds/modes gone too.
   with `pkexec`, which prompts for authentication once per shell session per
   your system's polkit policy.
 - Persists per-fan mode and thresholds at
-  `~/.config/eduard.cooler-control/state.json`.
+  `~/.config/eduard.cooler-control/state.json`; the bar icon style and the
+  expanded/compact choice live in the widget's entry in
+  `~/.config/omarchy/shell.json`.
 - Like every Quickshell plugin, this code runs unsandboxed inside the shared
   `omarchy-shell` process — review `Panel.qml` / `Service.qml` before
   installing.
@@ -189,7 +238,7 @@ that by hand if you want thresholds/modes gone too.
 | File           | Purpose                                                          |
 |----------------|-------------------------------------------------------------------|
 | `manifest.json`| Plugin manifest (`service` + `bar-widget`)                        |
-| `Panel.qml`    | Bar icon + popup UI (graph, gauge, sliders)                       |
+| `Panel.qml`    | Bar icon + popup UI (graph, gauge, sliders, expanded fan cards)   |
 | `Service.qml`  | hwmon detection, polling, fan-curve loop, privileged writes        |
 | `Model.js`     | Curve math, formatting, threshold ordering                        |
 

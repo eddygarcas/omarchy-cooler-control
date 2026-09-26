@@ -43,7 +43,9 @@ QtObject {
   // [{ key, label, autoLabel, customLabel, fanPath, pwmPath, enablePath,
   //    faultPath, originalEnable, rpm, duty, unplugged, unpluggedStreak,
   //    mode, quietC, rampC, fullC, pendingApply, identifying,
-  //    lastAttemptAtMs, lastAppliedDuty }]
+  //    lastAttemptAtMs, lastAppliedDuty, rpmHistory, dutyHistory }]
+  // rpmHistory/dutyHistory are the last HISTORY_LENGTH polls of that zone
+  // (same window as tempHistory), for the per-fan sparklines.
   property var fanZones: []
   property string selectedZoneKey: ""
   property bool detecting: false
@@ -99,7 +101,7 @@ QtObject {
       quietC: thresholds.quietC,
       rampC: thresholds.rampC,
       fullC: thresholds.fullC,
-      customLabel: (stored && typeof stored.customLabel === "string") ? stored.customLabel : ""
+      customLabel: Model.cleanLabel(stored && stored.customLabel)
     }
   }
 
@@ -147,7 +149,7 @@ QtObject {
   function setLabel(key, label) {
     var zone = zoneByKey(key)
     if (!zone) return
-    var trimmed = String(label || "").trim()
+    var trimmed = Model.cleanLabel(label)
     replaceZone(key, { customLabel: trimmed, label: trimmed || zone.autoLabel })
     saveState()
   }
@@ -223,6 +225,8 @@ QtObject {
           for (var k in zone) copy[k] = zone[k]
           copy.rpm = isFinite(rpm) && rpm >= 0 ? rpm : -1
           copy.duty = isFinite(raw255) ? Model.rawToDuty(raw255) : -1
+          copy.rpmHistory = Model.pushHistory(zone.rpmHistory, copy.rpm >= 0 ? copy.rpm : 0)
+          copy.dutyHistory = Model.pushHistory(zone.dutyHistory, copy.duty >= 0 ? copy.duty : 0)
           var next = Model.nextUnpluggedState(
             { unplugged: zone.unplugged, streak: zone.unpluggedStreak },
             { rpm: copy.rpm, duty: copy.duty, fault: faultRaw === "1" }
@@ -471,7 +475,7 @@ QtObject {
         cpuPath = fields[1] || ""
       } else if (fields[0] === "zone") {
         var key = fields[1] || ""
-        var sensorLabel = (fields[2] || "").trim()
+        var sensorLabel = Model.cleanLabel(fields[2])
         var pwmPath = fields[3] || ""
         var enablePath = fields[4] || ""
         var fanPath = fields[5] || ""
@@ -513,7 +517,9 @@ QtObject {
           pendingApply: existing ? existing.pendingApply : false,
           identifying: existing ? existing.identifying : false,
           lastAppliedDuty: existing ? existing.lastAppliedDuty : undefined,
-          lastAttemptAtMs: existing ? existing.lastAttemptAtMs : 0
+          lastAttemptAtMs: existing ? existing.lastAttemptAtMs : 0,
+          rpmHistory: existing ? existing.rpmHistory : [],
+          dutyHistory: existing ? existing.dutyHistory : []
         })
       }
     }
