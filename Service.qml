@@ -43,9 +43,17 @@ QtObject {
   // [{ key, label, autoLabel, customLabel, fanPath, pwmPath, enablePath,
   //    faultPath, originalEnable, rpm, duty, unplugged, unpluggedStreak,
   //    mode, quietC, rampC, fullC, pendingApply, identifying,
-  //    lastAttemptAtMs, lastAppliedDuty, rpmHistory, dutyHistory }]
+  //    lastAttemptAtMs, lastAppliedDuty, rpmHistory, dutyHistory,
+  //    hwEnable, lastWriteFailed, touched }]
   // rpmHistory/dutyHistory are the last HISTORY_LENGTH polls of that zone
-  // (same window as tempHistory), for the per-fan sparklines.
+  // (same window as tempHistory), for the per-fan sparklines. hwEnable is
+  // the pwmN_enable value actually read from sysfs on the last poll ("1" is
+  // manual, i.e. software-driven; 2+ is one of the chip's own automatic
+  // modes) -- the panel compares it with `mode` so a fan the board is *not*
+  // driving is never quietly shown as "Auto". lastWriteFailed is the exit
+  // status of the most recent write for that zone; touched means this
+  // session has driven the zone at least once (so an automatic hand-back
+  // is ours to do rather than a change to a board setup we never touched).
   property var fanZones: []
   property string selectedZoneKey: ""
   property bool detecting: false
@@ -188,8 +196,11 @@ QtObject {
     interval: root.thresholdApplyDebounceMs
     repeat: false
     onTriggered: {
+      // The mode can flip to auto inside the debounce window (drag a
+      // threshold, then flip the switch); a duty write then would put the
+      // header straight back into manual mode behind the user's back.
       var zone = root.zoneByKey(zoneKey)
-      if (zone) root.applyDutyFor(zone)
+      if (zone && zone.mode === "custom") root.applyDutyFor(zone)
     }
   }
 
@@ -200,6 +211,7 @@ QtObject {
       args.push(root.fanZones[i].fanPath || "")
       args.push(root.fanZones[i].pwmPath || "")
       args.push(root.fanZones[i].faultPath || "")
+      args.push(root.fanZones[i].enablePath || "")
     }
     readProcess.command = args
     readProcess.running = true
@@ -219,12 +231,14 @@ QtObject {
         var rpm = Number(fields[1])
         var raw255 = Number(fields[2])
         var faultRaw = fields[3]
+        var enableRaw = (fields[4] || "").trim()
         var z = nextZones[zoneIndex]
         nextZones[zoneIndex] = (function(zone) {
           var copy = {}
           for (var k in zone) copy[k] = zone[k]
           copy.rpm = isFinite(rpm) && rpm >= 0 ? rpm : -1
           copy.duty = isFinite(raw255) ? Model.rawToDuty(raw255) : -1
+          copy.hwEnable = /^[0-9]$/.test(enableRaw) ? enableRaw : ""
           copy.rpmHistory = Model.pushHistory(zone.rpmHistory, copy.rpm >= 0 ? copy.rpm : 0)
           copy.dutyHistory = Model.pushHistory(zone.dutyHistory, copy.duty >= 0 ? copy.duty : 0)
           var next = Model.nextUnpluggedState(
@@ -264,11 +278,22 @@ QtObject {
     var now = Date.now()
     for (var i = 0; i < fanZones.length; i++) {
       var z = fanZones[i]
-      if (z.mode !== "custom" || z.pendingApply || z.identifying) continue
-      var target = Model.dutyForTemperature(root.cpuTemperature > 0 ? root.cpuTemperature : Model.TEMP_MAX, z)
-      var drift = Math.abs(target - (z.lastAppliedDuty === undefined ? -100 : z.lastAppliedDuty))
+      if (z.pendingApply || z.identifying) continue
       var dueForRetry = !z.lastAttemptAtMs || (now - z.lastAttemptAtMs) >= applyMinIntervalMs
-      if (drift >= applyHysteresis && dueForRetry) applyDutyFor(z, target)
+      if (z.mode === "custom") {
+        var target = Model.dutyForTemperature(root.cpuTemperature > 0 ? root.cpuTemperature : Model.TEMP_MAX, z)
+        var drift = Math.abs(target - (z.lastAppliedDuty === undefined ? -100 : z.lastAppliedDuty))
+        // A header we drove that no longer reads manual has been taken
+        // back by the board (BIOS, another tool): the curve is not in
+        // charge whatever lastAppliedDuty says, so reassert it.
+        var boardTookOver = z.touched && z.hwEnable !== "" && z.hwEnable !== "1"
+        if ((drift >= applyHysteresis || boardTookOver) && dueForRetry) applyDutyFor(z, target)
+      } else if (z.touched && Model.boardNotInControl(z) && dueForRetry) {
+        // "Auto" but still manual after we drove it: the hand-back write
+        // never landed (cancelled prompt, helper died). Keep trying at the
+        // same pace as the curve loop; the panel shows the state meanwhile.
+        restoreAuto(z)
+      }
     }
   }
 
@@ -286,10 +311,27 @@ QtObject {
     })
   }
 
+  // Hands a header back to the board's own fan logic. Not gated on
+  // pendingApply: the queue is serialized, so a hand-back requested while a
+  // duty write is still in flight simply lands right after it -- the old
+  // early return dropped exactly that request on the floor, leaving the
+  // fan in manual mode while the panel said "Auto".
   function restoreAuto(zone) {
-    if (!zone || !zone.enablePath || zone.originalEnable === "" || zone.pendingApply || zone.identifying) return
+    if (!zone || !zone.enablePath || zone.identifying) return
+    var target = Model.autoEnableValue(zone, fanZones)
+    if (target === "") return
     replaceZone(zone.key, { pendingApply: true, lastAttemptAtMs: Date.now() })
-    enqueueWrite({ kind: "restore", zoneKey: zone.key, enablePath: zone.enablePath, value: zone.originalEnable })
+    enqueueWrite({ kind: "restore", zoneKey: zone.key, enablePath: zone.enablePath, value: target })
+  }
+
+  // Explicit user action from the panel for a zone whose hardware state
+  // disagrees with its mode (or whose last write failed): redo whatever
+  // that mode needs, right now.
+  function retryZone(key) {
+    var zone = zoneByKey(key)
+    if (!zone || zone.pendingApply || zone.identifying) return
+    if (zone.mode === "custom") applyDutyFor(zone)
+    else restoreAuto(zone)
   }
 
   readonly property int identifyDurationMs: 4000
@@ -519,7 +561,10 @@ QtObject {
           lastAppliedDuty: existing ? existing.lastAppliedDuty : undefined,
           lastAttemptAtMs: existing ? existing.lastAttemptAtMs : 0,
           rpmHistory: existing ? existing.rpmHistory : [],
-          dutyHistory: existing ? existing.dutyHistory : []
+          dutyHistory: existing ? existing.dutyHistory : [],
+          hwEnable: existing ? existing.hwEnable : (/^[0-9]$/.test(originalEnable) ? originalEnable : ""),
+          lastWriteFailed: existing ? existing.lastWriteFailed : false,
+          touched: existing ? existing.touched : false
         })
       }
     }
@@ -571,7 +616,8 @@ QtObject {
     "done"
   ].join("\n")
 
-  // args: cpuTempPath, zoneCount, then fanPath/pwmPath/faultPath triples.
+  // args: cpuTempPath, zoneCount, then fanPath/pwmPath/faultPath/enablePath
+  // quads.
   readonly property string _readScript: [
     "cpu_path=\"$1\"; shift",
     "count=\"$1\"; shift",
@@ -580,11 +626,12 @@ QtObject {
     "fi",
     "i=0",
     "while [ \"$i\" -lt \"$count\" ]; do",
-    "  fan_path=\"$1\"; pwm_path=\"$2\"; fault_path=\"$3\"; shift 3",
+    "  fan_path=\"$1\"; pwm_path=\"$2\"; fault_path=\"$3\"; enable_path=\"$4\"; shift 4",
     "  rpm=\"\"; [ -n \"$fan_path\" ] && [ -r \"$fan_path\" ] && read -r rpm < \"$fan_path\"",
     "  duty=\"\"; [ -n \"$pwm_path\" ] && [ -r \"$pwm_path\" ] && read -r duty < \"$pwm_path\"",
     "  fault=\"\"; [ -n \"$fault_path\" ] && [ -r \"$fault_path\" ] && read -r fault < \"$fault_path\"",
-    "  printf 'zone\\t%s\\t%s\\t%s\\n' \"$rpm\" \"$duty\" \"$fault\"",
+    "  enable=\"\"; [ -n \"$enable_path\" ] && [ -r \"$enable_path\" ] && read -r enable < \"$enable_path\"",
+    "  printf 'zone\\t%s\\t%s\\t%s\\t%s\\n' \"$rpm\" \"$duty\" \"$fault\" \"$enable\"",
     "  i=$((i+1))",
     "done"
   ].join("\n")
@@ -676,14 +723,20 @@ QtObject {
   function _completeWrite(item, exitCode) {
     root._writeBusy = false
     if (item) {
+      var ok = exitCode === 0
       if (item.kind === "identify") {
         // Never set pendingApply — `identifying` alone gates the zone for
         // its whole pulse-then-revert lifecycle (see identifyZone).
-        if (exitCode === 0) root._scheduleIdentifyRevert(item.zoneKey)
+        root.replaceZone(item.zoneKey, ok ? { lastWriteFailed: false, touched: true } : { lastWriteFailed: true })
+        if (ok) root._scheduleIdentifyRevert(item.zoneKey)
         else root._finishIdentify(item.zoneKey)
       } else {
-        var patch = { pendingApply: false }
-        if (exitCode === 0 && item.kind === "duty") patch.lastAppliedDuty = item.targetDuty
+        var patch = { pendingApply: false, lastWriteFailed: !ok }
+        if (ok && item.kind === "duty") { patch.lastAppliedDuty = item.targetDuty; patch.touched = true }
+        // A successful hand-back makes its target the value to restore to
+        // from now on -- matters when the "original" we captured was
+        // itself a leftover manual mode and we fell back to a real one.
+        if (ok && item.kind === "restore") { patch.originalEnable = item.value; patch.lastAppliedDuty = undefined }
         root.replaceZone(item.zoneKey, patch)
       }
     }

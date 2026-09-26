@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "eduard.cooler-control",
   "name": "Cooler Control",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "Eduard G. Castelló",
   "license": "MIT",
   "homepage": "https://github.com/eddygarcas/omarchy-cooler-control",

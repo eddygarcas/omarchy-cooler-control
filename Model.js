@@ -175,6 +175,46 @@ function historyCeiling(history, floor) {
   return Math.max(Number(floor) || 0, Math.ceil(withHeadroom / step) * step)
 }
 
+// pwmN_enable per the hwmon sysfs ABI: 0 = no control (full speed),
+// 1 = manual (software sets pwmN), 2 and up = one of the chip's own
+// automatic modes. "The board is in control" therefore means 2+.
+function isManualEnable(value) {
+  return String(value) === "1" || String(value) === "0"
+}
+
+// A zone the user has on "auto" whose header still reads manual: the board
+// is not driving that fan, whatever the panel's switch says.
+function boardNotInControl(zone) {
+  if (!zone || !zone.enablePath || zone.hwEnable === "" || zone.hwEnable === undefined) return false
+  return zone.mode !== "custom" && isManualEnable(zone.hwEnable)
+}
+
+// Which pwmN_enable value hands a header back to the board. Normally the
+// value captured at detection -- unless that was already manual (a previous
+// session's hand-back never landed, or another tool left it so), in which
+// case "restoring" it would restore nothing. Then borrow the automatic mode
+// the other headers on the same chip are running (nct6775 boards typically
+// have every header on the same SmartFan mode), and failing that use 2, the
+// ABI's generic "automatic" value. "" means there is nothing to write.
+function autoEnableValue(zone, zones) {
+  if (!zone || !zone.enablePath) return ""
+  var original = String(zone.originalEnable === undefined ? "" : zone.originalEnable)
+  if (/^[2-9]$/.test(original)) return original
+  var counts = {}
+  for (var i = 0; zones && i < zones.length; i++) {
+    var z = zones[i]
+    if (!z || z.key === zone.key) continue
+    var candidates = [z.hwEnable, z.originalEnable]
+    for (var c = 0; c < candidates.length; c++) {
+      var v = String(candidates[c] === undefined ? "" : candidates[c])
+      if (/^[2-9]$/.test(v)) counts[v] = (counts[v] || 0) + 1
+    }
+  }
+  var best = "", bestCount = 0
+  for (var k in counts) if (counts[k] > bestCount) { best = k; bestCount = counts[k] }
+  return best || "2"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     MIN_DUTY: MIN_DUTY,
@@ -202,6 +242,9 @@ if (typeof module !== "undefined") {
     rawToDuty: rawToDuty,
     UNPLUGGED_STREAK_THRESHOLD: UNPLUGGED_STREAK_THRESHOLD,
     UNPLUGGED_MIN_DUTY: UNPLUGGED_MIN_DUTY,
-    nextUnpluggedState: nextUnpluggedState
+    nextUnpluggedState: nextUnpluggedState,
+    isManualEnable: isManualEnable,
+    boardNotInControl: boardNotInControl,
+    autoEnableValue: autoEnableValue
   }
 }

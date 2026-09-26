@@ -122,6 +122,21 @@ Panel {
   onZonesChanged: refreshZoneKeys()
   Component.onCompleted: refreshZoneKeys()
 
+  // Hardware truth vs. the switch. Empty when the header is doing what the
+  // mode says; otherwise a one-line reason, shown in urgent colour next to
+  // a button that redoes the write (svc.retryZone).
+  function zoneWarning(zone) {
+    if (!zone || !zone.enablePath) return ""
+    if (zone.lastWriteFailed) return "Last write to the fan controller failed — authentication cancelled?"
+    if (Model.boardNotInControl(zone)) return "Header is in manual mode — the board is not driving this fan"
+    if (zone.mode === "custom" && zone.hwEnable !== "" && !Model.isManualEnable(zone.hwEnable))
+      return "The board took this fan back — the custom curve is not in charge"
+    return ""
+  }
+  function zoneRetryLabel(zone) {
+    return zone && zone.mode === "custom" ? "Reapply curve" : "Hand back to board"
+  }
+
   // One entry point for every way of moving a threshold: compact sliders,
   // card steppers, and dragging a breakpoint on either curve chart.
   function commitThreshold(key, which, temp) {
@@ -143,7 +158,8 @@ Panel {
   readonly property var placeholderZone: ({
     key: "", label: "", autoLabel: "", customLabel: "", fanPath: "",
     rpm: -1, duty: -1, unplugged: false, identifying: false, mode: "auto",
-    quietC: 45, rampC: 65, fullC: 80, rpmHistory: [], dutyHistory: []
+    quietC: 45, rampC: 65, fullC: 80, rpmHistory: [], dutyHistory: [],
+    enablePath: "", hwEnable: "", lastWriteFailed: false, pendingApply: false
   })
 
   // Up to three cards per row at a comfortable width; on a screen too narrow
@@ -566,6 +582,35 @@ Panel {
             onClicked: {
               if (root.svc && root.selectedZone)
                 root.svc.setMode(root.selectedZone.key, root.customMode ? "auto" : "custom")
+            }
+          }
+
+          // Shown only when sysfs disagrees with the switch above.
+          RowLayout {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: root.zoneWarning(root.selectedZone) !== ""
+
+            Text {
+              textFormat: Text.PlainText
+              Layout.fillWidth: true
+              text: root.zoneWarning(root.selectedZone)
+              color: Color.urgent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Button {
+              text: root.zoneRetryLabel(root.selectedZone)
+              tooltipText: "Writes the mode this switch says to the fan controller again"
+              fontSize: Style.font.bodySmall
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              bordered: true
+              radius: height / 2
+              enabled: root.selectedZone !== null && !root.selectedZone.pendingApply && !root.identifyBusy
+              onClicked: { if (root.svc && root.selectedZone) root.svc.retryZone(root.selectedZone.key) }
             }
           }
 
@@ -1409,15 +1454,19 @@ Panel {
       Text {
         textFormat: Text.PlainText
         width: parent.width
+        readonly property string warning: root.zoneWarning(card.fan)
         text: card.fan.identifying
           ? "Identifying — held at 100% for a few seconds"
-          : card.custom
-            ? "Custom curve · " + Model.formatTemp(root.cpuTemperature) + " → " + Model.formatDuty(Model.dutyForTemperature(root.cpuTemperature > 0 ? root.cpuTemperature : Model.TEMP_MAX, card.fan))
-            : "Auto — the board's own fan curve is in charge"
-        color: card.fan.identifying ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+          : warning !== ""
+            ? warning
+            : card.custom
+              ? "Custom curve · " + Model.formatTemp(root.cpuTemperature) + " → " + Model.formatDuty(Model.dutyForTemperature(root.cpuTemperature > 0 ? root.cpuTemperature : Model.TEMP_MAX, card.fan))
+              : "Auto — the board's own fan curve is in charge"
+        color: card.fan.identifying ? Color.accent : warning !== "" ? Color.urgent : Qt.darker(root.bar.foreground, 1.6)
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
+        wrapMode: warning !== "" ? Text.WordWrap : Text.NoWrap
+        elide: warning !== "" ? Text.ElideNone : Text.ElideRight
       }
 
       // ---- speed sparkline ----
@@ -1493,6 +1542,19 @@ Panel {
           radius: height / 2
           enabled: card.fan.key !== "" && !root.identifyBusy
           onClicked: { card.focusZone(); if (root.svc) root.svc.identifyZone(card.zoneKey) }
+        }
+
+        Button {
+          visible: root.zoneWarning(card.fan) !== ""
+          text: root.zoneRetryLabel(card.fan)
+          tooltipText: "Writes the mode the switch says to the fan controller again"
+          fontSize: Style.font.caption
+          foreground: Color.urgent
+          fontFamily: root.bar.fontFamily
+          bordered: true
+          radius: height / 2
+          enabled: !card.fan.pendingApply && !root.identifyBusy
+          onClicked: { card.focusZone(); if (root.svc) root.svc.retryZone(card.zoneKey) }
         }
 
         Text {

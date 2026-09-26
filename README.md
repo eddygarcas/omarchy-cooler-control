@@ -89,6 +89,16 @@ same.
   - The same curve is drawn above the sliders, and its three breakpoints
     can be dragged along the temperature axis as an alternative to the
     sliders (see "Expanded view" below for details).
+- **Hardware truth, not just the switch** — every poll also reads
+  `pwmN_enable`, the header's real control mode (`1` is manual, i.e.
+  software-driven; `2` and up are the chip's own automatic modes). When it
+  disagrees with the switch — the switch says Auto but the header is still
+  manual, the switch says Custom but the board has taken the fan back, or
+  the last write simply failed (a cancelled authentication prompt, say) —
+  both views say so in red next to a **Hand back to board** / **Reapply
+  curve** button that redoes the write. A header this plugin has driven in
+  the current session is also handed back automatically, at the same pace
+  as the curve loop, until the write lands.
 - **Expanded view** — the **Expand** button in the panel header swaps the
   single-fan layout for one rounded card per fan that is actually reporting
   RPM, up to three across (the popup is capped to the screen and the cards
@@ -148,7 +158,19 @@ restarts, keyed by hwmon chip name + pwm index (e.g. `nct6775-pwm1`).
   curve loop still only queues a write when the target duty actually drifts
   from the last *confirmed* value by 3 points or more, and won't retry the
   same zone inside a 15-second window. It does **not** install a udev rule
-  or polkit policy.
+  or polkit policy. A write that fails — most often because the prompt was
+  cancelled — is not silent: the zone shows the failure in red with a
+  button to redo it, and the panel always reflects the mode the header is
+  really in rather than the one that was requested.
+- **"Auto" restores the chip's own automatic mode.** Handing a header back
+  normally writes the `pwmN_enable` value captured when the plugin first
+  saw it. If that value was itself manual (`1`) — a previous session's
+  hand-back never landed, or another tool left it so — restoring it would
+  restore nothing, so the plugin instead uses the automatic mode the other
+  headers on the same chip are running, and failing that `2`, the sysfs
+  ABI's generic "automatic" value. On an nct6775-family chip that is
+  Thermal Cruise rather than the SmartFan mode your BIOS may have chosen;
+  set it back in the BIOS if you notice a difference.
 - **The CPU Fan / Case Fan N guess is only a guess** (unless your board's
   driver already populates `fanN_label`, in which case that's used
   instead) — sysfs has no notion of which pwm header a fan is actually
