@@ -13,8 +13,13 @@ Panel {
   readonly property var svc: bar && bar.shell ? bar.shell.serviceFor(root.moduleName) : null
   readonly property var zones: svc ? svc.fanZones : []
   // A pwm header with nothing plugged into it still shows up in sysfs — this
-  // is the subset Service has actually seen spin (see Model.nextUnpluggedState),
-  // and the only one offered as a selectable/controllable fan.
+  // is the subset Service has actually seen spin (see Model.nextUnpluggedState).
+  // It drives the bar icon's "fastest fan" readout and the no-fan hint below,
+  // but *not* which zones are listed: a header with 0 RPM is dimmed in the
+  // selector rather than removed, because "no RPM" also describes a
+  // perfectly real fan with no tachometer wire (2/3-pin on a 4-pin header),
+  // and Identify -- the one action that drives a fan hard enough to judge it
+  // -- used to make exactly such a fan vanish from the list mid-click.
   readonly property var connectedZones: root.zones.filter(function(z) { return !z.unplugged })
   readonly property bool available: svc ? svc.available : false
   readonly property bool detecting: svc ? svc.detecting : false
@@ -23,7 +28,7 @@ Panel {
   readonly property var tempHistory: svc ? svc.tempHistory : []
   readonly property string selectedZoneKey: svc ? svc.selectedZoneKey : ""
   readonly property var selectedZone: {
-    var pool = root.connectedZones
+    var pool = root.zones
     if (pool.length === 0) return null
     for (var i = 0; i < pool.length; i++)
       if (pool[i].key === root.selectedZoneKey) return pool[i]
@@ -261,9 +266,9 @@ Panel {
                 + "Most desktop boards expose one once lm_sensors probes and loads "
                 + "the right Super I/O driver (nct6775, it87, ...)."
               : "Found " + root.zones.length + " fan header" + (root.zones.length === 1 ? "" : "s")
-                + ", but none of them seem to have a fan plugged in — driving them "
-                + "hasn't produced any RPM signal. Reseat the cable or try a different "
-                + "header if you expected one here."
+                + ", but none has reported an RPM signal yet. That usually means "
+                + "nothing is plugged in — or the fan has no tachometer wire. Every "
+                + "header stays listed below either way; use Identify to check by ear."
             color: Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -295,16 +300,23 @@ Panel {
         }
 
         // ---------- Zone selector ----------
-        Row {
+        // Every header the board exposes, always. One with no RPM reading is
+        // dimmed (it may be empty, or a fan with no tachometer) but stays
+        // selectable so it can still be identified, renamed, or driven.
+        Flow {
           width: parent.width
           spacing: Style.space(8)
-          visible: root.connectedZones.length > 1
+          visible: root.zones.length > 1
 
           Repeater {
-            model: root.connectedZones
+            model: root.zones
             Button {
               required property var modelData
               text: modelData.label
+              opacity: modelData.unplugged ? 0.5 : 1
+              tooltipText: modelData.unplugged
+                ? "No RPM reading — nothing plugged in, or a fan without a tachometer wire"
+                : ""
               selected: modelData.key === root.selectedZoneKey
               fontSize: Style.font.bodySmall
               foreground: root.bar.foreground
@@ -335,13 +347,32 @@ Panel {
             TextField {
               id: labelField
               Layout.fillWidth: true
-              text: root.selectedZone ? root.selectedZone.customLabel : ""
               placeholderText: root.selectedZone ? root.selectedZone.autoLabel : ""
               foreground: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.bodySmall
               verticalPadding: Style.space(4)
-              onEditingFinished: { if (root.svc && root.selectedZone) root.svc.setLabel(root.selectedZone.key, text) }
+
+              // `text` is deliberately not bound to the zone's label. Every
+              // poll (Service.applyReadResults, every 2s) rebuilds the zone
+              // objects, so a plain binding would re-evaluate on each tick
+              // and overwrite whatever the user is mid-way through typing.
+              // Instead the saved label is tracked here and only pushed
+              // into the field while it isn't focused -- or whenever the
+              // selected zone itself changes, since that's a different
+              // fan's name and the old draft no longer applies.
+              readonly property string savedLabel: root.selectedZone ? root.selectedZone.customLabel : ""
+              readonly property string zoneKey: root.selectedZone ? root.selectedZone.key : ""
+
+              Component.onCompleted: text = savedLabel
+              onSavedLabelChanged: if (!activeFocus) text = savedLabel
+              onZoneKeyChanged: text = savedLabel
+              onEditingFinished: {
+                if (root.svc && root.selectedZone) root.svc.setLabel(root.selectedZone.key, text)
+                // Service trims the label; reflect that back even while the
+                // field still has focus (Enter commits without blurring).
+                text = savedLabel
+              }
             }
 
             Button {
@@ -361,11 +392,14 @@ Panel {
             textFormat: Text.PlainText
             width: parent.width
             text: root.selectedZone
-              ? root.selectedZone.key + (root.selectedZone.fanPath !== "" ? " · has tachometer" : " · no tachometer reading")
+              ? root.selectedZone.key + (root.selectedZone.fanPath === "" ? " · no tachometer input"
+                : root.selectedZone.unplugged ? " · no RPM reading (unplugged, or no tachometer wire)"
+                : " · has tachometer")
               : ""
             color: Qt.darker(root.bar.foreground, 1.6)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
           }
         }
 

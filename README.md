@@ -47,14 +47,17 @@ same.
   ambient reading.
 - **Fan gauge** — an open-arc dial (same look as Omarchy's own network/disk
   speed-test dials) showing the selected fan's current duty cycle and RPM.
-- **Zone selector** — one pill button per pwm-capable fan the board exposes
-  (CPU fan, case fans, pump, ...) that's actually plugged in, if there's more
-  than one. A pwm header still shows up in sysfs with nothing connected to
-  it, so this plugin drives each one and watches for an RPM response (or the
-  chip's own fault flag, when it reports one) before offering it as a fan —
-  an unplugged header never appears as a selectable zone. Unplugging a fan
-  that was previously spinning removes it from the list within a few polls,
-  same as if it had never been there.
+- **Zone selector** — one pill button per pwm-capable header the board
+  exposes (CPU fan, case fans, pump, ...), if there's more than one. A pwm
+  header still shows up in sysfs with nothing connected to it, so this
+  plugin watches each one for an RPM response (or the chip's own fault flag,
+  when it reports one): a header that has been driven hard and still reads
+  0 RPM is **dimmed**, not removed — "no RPM" also describes a real fan with
+  no tachometer wire (a 2- or 3-pin fan on a 4-pin header), and the one
+  action that drives a fan hard enough to judge it is Identify, which used
+  to make exactly such a fan vanish from the list mid-click. A dimmed zone
+  stays selectable so it can still be identified, renamed, or driven; the
+  caption under the name field says why it's dimmed.
 - **Fan name + Identify** — sysfs has no concept of "front fan" or "CPU fan"
   beyond whatever label the board's own driver happens to report (many
   report none at all), so each zone starts out guessed: the first
@@ -88,14 +91,17 @@ restarts, keyed by hwmon chip name + pwm index (e.g. `nct6775-pwm1`).
 ## Known limitations
 
 - **Reads never need privilege; writes do.** Setting `pwmN_enable`/`pwmN` is
-  root-only on stock sysfs permissions, so every write goes through
-  `pkexec`. The unattended curve loop only queues a write when the target
-  duty actually drifts from the last *confirmed* value by 3 points or more,
-  and won't retry the same zone inside a 15-second window — so a system
-  sitting at a steady temperature stays silent. It does **not** install a
-  udev rule or polkit policy to make those writes passwordless, so depending
-  on your polkit setup you may see an authentication prompt again a few
-  minutes after the last one, even with nothing else changed.
+  root-only on stock sysfs permissions. Every write is first tried as your
+  own user (a udev rule granting group write on those files makes that
+  succeed); when that's refused, the plugin starts **one** privileged helper
+  for the rest of the shell session via `pkexec`, which prompts for
+  authentication once, and hands every later write to that same helper —
+  so you're asked once per session, not once per write. The helper exits
+  when the shell does (or when the prompt is cancelled). The unattended
+  curve loop still only queues a write when the target duty actually drifts
+  from the last *confirmed* value by 3 points or more, and won't retry the
+  same zone inside a 15-second window. It does **not** install a udev rule
+  or polkit policy.
 - **The CPU Fan / Case Fan N guess is only a guess** (unless your board's
   driver already populates `fanN_label`, in which case that's used
   instead) — sysfs has no notion of which pwm header a fan is actually
@@ -104,15 +110,13 @@ restarts, keyed by hwmon chip name + pwm index (e.g. `nct6775-pwm1`).
 - **Only one fan can be identified at a time.** Clicking Identify on
   another zone while one is already spinning up does nothing until the
   first one's pulse finishes (a few seconds).
-- **"Connected" detection needs at least one real spin-up to confirm.** A
-  zone is only marked connected once it's actually reported RPM > 0 (proof
-  of life), so right after enabling this plugin every zone is assumed
-  connected until the board's own duty happens to sit low enough, long
-  enough, for a truly unplugged header to be caught (see `Model.js`'s
-  `nextUnpluggedState`). A fan will disappear from the list once it's been
-  driven hard and stayed at 0 RPM for a few consecutive polls in a row — if
-  a real fan briefly reads 0 RPM at very low duty (some fans stop
-  completely below their minimum start voltage), that alone won't hide it.
+- **"No RPM" is a hint, not proof of an empty header.** A zone is only
+  marked as having a fan once it's actually reported RPM > 0 (proof of
+  life), and is dimmed once it's been driven at a real duty and stayed at
+  0 RPM for a few consecutive polls (see `Model.js`'s `nextUnpluggedState`).
+  A fan without a tachometer wire will always be dimmed; it still works.
+  A real fan briefly reading 0 RPM at very low duty (some stop completely
+  below their minimum start voltage) won't be dimmed by that alone.
 - **No fan chip found ≠ no fans.** Some boards' Super I/O / EC fan control
   never surfaces to Linux's hwmon subsystem at all; `sensors-detect` can't
   create hardware support that doesn't exist. If detection keeps coming up
@@ -141,9 +145,10 @@ that by hand if you want thresholds/modes gone too.
 - Requires `lm_sensors` (for `sensors-detect`) if your board's fan controller
   isn't already exposed under `/sys/class/hwmon/`.
 - Reads sysfs directly — no other packages or network access required.
-- Writes to `pwmN` / `pwmN_enable` under `/sys/class/hwmon/` go through
-  `pkexec`, which will prompt for authentication per your system's polkit
-  policy.
+- Writes to `pwmN` / `pwmN_enable` under `/sys/class/hwmon/` that the
+  plain user can't perform go through a single per-session helper started
+  with `pkexec`, which prompts for authentication once per shell session per
+  your system's polkit policy.
 - Persists per-fan mode and thresholds at
   `~/.config/eduard.cooler-control/state.json`.
 - Like every Quickshell plugin, this code runs unsandboxed inside the shared
@@ -156,11 +161,13 @@ that by hand if you want thresholds/modes gone too.
   `sensors-detect`) is invoked by absolute path (`/usr/bin/...`), not by bare
   name — a privileged invocation should never let `PATH` decide what
   actually runs as root.
-- Both scripts that run as root via `pkexec` (writing `pwmN`/`pwmN_enable`,
-  and restoring `pwmN_enable` when a fan leaves custom mode) independently
-  re-verify their path argument before touching anything: it must resolve
-  under `/sys/class/hwmon/`, contain no `..` traversal segment, and not be a
-  symlink. Unprivileged users can't actually plant a node under
+- The per-session helper that runs as root via `pkexec` speaks a fixed
+  two-field protocol (`path<TAB>value`, one write per line) and nothing
+  else: the value must be a plain integer 0–255, and the path is
+  independently re-verified before every write — it must resolve under
+  `/sys/class/hwmon/`, contain no `..` traversal segment, and not be a
+  symlink. Any malformed line makes the helper exit rather than skip it.
+  The unprivileged one-shot write scripts apply the same path guard. Unprivileged users can't actually plant a node under
   `/sys/class/hwmon` — it's kernel-managed — so this isn't fixing an
   exploitable-today hole, but a privileged script that trusts a path just
   because its own caller is "this plugin's JS" is exactly the class of thing

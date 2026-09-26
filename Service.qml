@@ -6,19 +6,22 @@ import "Model.js" as Model
 // Polls CPU temperature and every pwm-capable fan the system exposes over
 // sysfs (/sys/class/hwmon), and — for zones the user switches to "custom" —
 // writes a software fan curve back to the hardware. Reads never need
-// privilege; writes to pwm*/pwm*_enable are attempted unprivileged first and
-// only escalate to pkexec on failure (see _writeCommandFor) — a system with
-// a udev rule granting group write on those files (see the plugin's setup
-// notes) never needs pkexec at all, which matters because
-// org.freedesktop.policykit.exec caches no authentication, so every
-// escalated write used to mean a fresh password/FIDO2 prompt. To keep the
-// unattended curve loop from prompting every couple of seconds on a system
-// without that udev rule, its writes only fire when the target duty
-// actually drifts (see applyCurveTick) and are throttled to one attempt per
-// zone per applyMinIntervalMs; a direct user action (mode toggle) applies
-// immediately instead, while threshold slider releases are debounced (see
-// setThresholds) so editing quiet/ramp/full in one sitting triggers at most
-// one write rather than one per slider.
+// privilege; writes to pwm*/pwm*_enable are attempted unprivileged first
+// (a udev rule granting group write on those files makes that succeed) and
+// only escalate on failure. Escalation goes through ONE privileged helper
+// per shell session (see helperProcess): the first failed write starts it
+// via pkexec, which prompts once, and every later write is handed to that
+// same helper over stdin, so the password is asked for once per session
+// rather than once per write -- org.freedesktop.policykit.exec caches no
+// authentication, so the old pkexec-per-write approach re-prompted every
+// time. The helper only accepts a tiny fixed protocol (path<TAB>value) and
+// re-verifies every path against the sysfs hwmon tree itself (see
+// _helperScript). The unattended curve loop still only writes when the
+// target duty actually drifts (see applyCurveTick) and is throttled to one
+// attempt per zone per applyMinIntervalMs; a direct user action (mode
+// toggle) applies immediately instead, while threshold slider releases are
+// debounced (see setThresholds) so editing quiet/ramp/full in one sitting
+// triggers at most one write rather than one per slider.
 QtObject {
   id: root
 
@@ -236,15 +239,15 @@ QtObject {
     applyCurveTick()
   }
 
-  // If the selected zone just got flagged unplugged and a connected one
-  // exists, hand selection to that one rather than leaving the panel
-  // pointed at a fan the user can no longer act on.
+  // Only re-point selection when the selected zone no longer exists at all.
+  // Being flagged unplugged is not a reason to move it: that flag also
+  // fires for a real fan with no tachometer wire, and it fires *during
+  // Identify* -- the moment the user is most deliberately looking at that
+  // zone -- so stealing the selection there made the panel jump away from
+  // the fan they had just clicked.
   function reconcileSelectedZone() {
-    var current = zoneByKey(selectedZoneKey)
-    if (current && !current.unplugged) return
-    for (var i = 0; i < fanZones.length; i++) {
-      if (!fanZones[i].unplugged) { selectedZoneKey = fanZones[i].key; return }
-    }
+    if (zoneByKey(selectedZoneKey)) return
+    if (fanZones.length > 0) selectedZoneKey = fanZones[0].key
   }
 
   // Runs every refresh tick. A zone in "custom" mode only gets a write
@@ -331,22 +334,111 @@ QtObject {
     _writeBusy = true
     var item = _writeQueue.shift()
     writeProcess.currentItem = item
-    writeProcess.command = _writeCommandFor(item, false)
+    writeProcess.command = _writeCommandFor(item)
     writeProcess.running = true
   }
 
-  // A udev rule can grant a group (see the eduard.cooler-control setup docs)
-  // write access to pwm*/pwm*_enable directly, so try the plain write first
-  // and only pay for pkexec — and its authentication prompt — when that
-  // fails. Once the udev rule + group membership are in place this never
-  // escalates, which is what actually stops the repeated auth prompts:
-  // org.freedesktop.policykit.exec has no auth caching, so every escalated
-  // write used to mean a fresh prompt.
-  function _writeCommandFor(item, escalate) {
-    var bin = escalate ? [root._pkexecBin, root._bashBin] : [root._bashBin]
+  // A udev rule can grant a group write access to pwm*/pwm*_enable
+  // directly, so try the plain write first and only pay for privilege --
+  // and its one-per-session authentication prompt -- when that fails.
+  function _writeCommandFor(item) {
+    var bin = [root._bashBin]
     return (item.kind === "duty" || item.kind === "identify")
       ? bin.concat(["-c", root._writeDutyScript, "bash", item.pwmPath, item.enablePath, String(item.raw)])
       : bin.concat(["-c", root._writeValueScript, "bash", item.enablePath, item.value])
+  }
+
+  // The same writes, as the helper's path<TAB>value lines, in order.
+  function _helperOpsFor(item) {
+    var ops = []
+    if (item.kind === "duty" || item.kind === "identify") {
+      if (item.enablePath) ops.push([item.enablePath, "1"])
+      ops.push([item.pwmPath, String(item.raw)])
+    } else {
+      ops.push([item.enablePath, String(item.value)])
+    }
+    return ops
+  }
+
+  // ------------------------------------------------ privileged helper
+
+  // One root helper per shell session. Started lazily by the first write
+  // that fails unprivileged, so a system with a permissive udev rule never
+  // spawns it at all. It exits by itself when the shell goes away (its
+  // stdin closes), when pkexec is cancelled, or on any protocol violation.
+  property bool _helperReady: false
+  // { item, ops, sent, replies, failed } for the write the helper is
+  // currently serving. Writes are already serialized by _writeBusy, so
+  // there is never more than one.
+  property var _helperCurrent: null
+
+  function _sendToHelper(item) {
+    root._helperCurrent = { item: item, ops: root._helperOpsFor(item), sent: false, replies: 0, failed: false }
+    if (!helperProcess.running) {
+      root._helperReady = false
+      helperProcess.running = true   // pkexec prompts here, once
+      return                          // ops go out on the "ready" line
+    }
+    if (root._helperReady) root._flushHelperOps()
+  }
+
+  function _flushHelperOps() {
+    var cur = root._helperCurrent
+    if (!cur || cur.sent) return
+    cur.sent = true
+    for (var i = 0; i < cur.ops.length; i++)
+      helperProcess.write(cur.ops[i][0] + "\t" + cur.ops[i][1] + "\n")
+  }
+
+  function _onHelperLine(line) {
+    var text = String(line).trim()
+    if (text === "ready") {
+      root._helperReady = true
+      root._flushHelperOps()
+      return
+    }
+    var cur = root._helperCurrent
+    if (!cur || !cur.sent) return
+    if (text !== "ok") cur.failed = true
+    cur.replies++
+    if (cur.replies >= cur.ops.length) {
+      root._helperCurrent = null
+      root._completeWrite(cur.item, cur.failed ? 1 : 0)
+    }
+  }
+
+  function _onHelperExited(exitCode) {
+    root._helperReady = false
+    var cur = root._helperCurrent
+    root._helperCurrent = null
+    // Whatever was in flight (or waiting on the auth prompt) did not land.
+    if (cur) root._completeWrite(cur.item, exitCode !== 0 ? exitCode : 1)
+  }
+
+  // Runs as root. Reads path<TAB>value lines from stdin until EOF and
+  // performs each write only after independently re-checking the path (same
+  // guard as the one-shot scripts) and that the value is a plain integer in
+  // the pwm range. Replies "ok"/"err" per line so the caller can tell which
+  // writes actually landed. Any malformed line ends the helper outright
+  // rather than being skipped: the only legitimate writer is this file, so
+  // anything else on the pipe means the pipe is not trustworthy.
+  readonly property string _helperScript: root._guardFunction + "\n" + [
+    "echo ready",
+    "while IFS=\"$(printf '\\t')\" read -r path value; do",
+    "  case \"$value\" in ''|*[!0-9]*) echo \"err: bad value\" >&2; exit 2 ;; esac",
+    "  [ \"${#value}\" -le 3 ] && [ \"$value\" -le 255 ] || { echo \"err: value out of range\" >&2; exit 2; }",
+    "  guard \"$path\" || exit 2",
+    "  if printf '%s' \"$value\" 2>/dev/null > \"$path\"; then echo ok; else echo err; fi",
+    "done"
+  ].join("\n")
+
+  property Process helperProcess: Process {
+    id: helperProcess
+    running: false
+    stdinEnabled: true
+    command: [root._pkexecBin, root._bashBin, "-c", root._helperScript]
+    stdout: SplitParser { onRead: function(line) { root._onHelperLine(line) } }
+    onExited: function(exitCode) { root._onHelperExited(exitCode) }
   }
 
   function detectFanController() {
@@ -563,28 +655,33 @@ QtObject {
     command: []
     onExited: function(exitCode) {
       var item = writeProcess.currentItem
-      if (item && exitCode !== 0 && !item._escalated) {
-        item._escalated = true
-        writeProcess.command = root._writeCommandFor(item, true)
-        writeProcess.running = true
+      writeProcess.currentItem = null
+      if (item && exitCode !== 0) {
+        // Plain write refused (stock sysfs permissions) -- hand it to the
+        // session helper, which completes it via _completeWrite.
+        root._sendToHelper(item)
         return
       }
-      writeProcess.currentItem = null
-      root._writeBusy = false
-      if (item) {
-        if (item.kind === "identify") {
-          // Never set pendingApply — `identifying` alone gates the zone for
-          // its whole pulse-then-revert lifecycle (see identifyZone).
-          if (exitCode === 0) root._scheduleIdentifyRevert(item.zoneKey)
-          else root._finishIdentify(item.zoneKey)
-        } else {
-          var patch = { pendingApply: false }
-          if (exitCode === 0 && item.kind === "duty") patch.lastAppliedDuty = item.targetDuty
-          root.replaceZone(item.zoneKey, patch)
-        }
-      }
-      root.pumpWriteQueue()
+      root._completeWrite(item, exitCode)
     }
+  }
+
+  // Shared completion for both the unprivileged and the helper path.
+  function _completeWrite(item, exitCode) {
+    root._writeBusy = false
+    if (item) {
+      if (item.kind === "identify") {
+        // Never set pendingApply — `identifying` alone gates the zone for
+        // its whole pulse-then-revert lifecycle (see identifyZone).
+        if (exitCode === 0) root._scheduleIdentifyRevert(item.zoneKey)
+        else root._finishIdentify(item.zoneKey)
+      } else {
+        var patch = { pendingApply: false }
+        if (exitCode === 0 && item.kind === "duty") patch.lastAppliedDuty = item.targetDuty
+        root.replaceZone(item.zoneKey, patch)
+      }
+    }
+    root.pumpWriteQueue()
   }
 
   // Fires identifyDurationMs after a successful "identify" pulse write,
